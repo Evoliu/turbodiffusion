@@ -605,13 +605,6 @@ We welcome community members to help maintain and extend TurboDiffusion. Welcome
   year={2025}
 }
 
-@software{turbodiffusion2025,
-  title={TurboDiffusion: Accelerating Video Diffusion Models by 100-200 Times},
-  author={The TurboDiffusion Team},
-  url={https://github.com/thu-ml/TurboDiffusion},
-  year={2025}
-}
-
 @inproceedings{zhang2025sageattention,
   title={SageAttention: Accurate 8-Bit Attention for Plug-and-play Inference Acceleration}, 
   author={Zhang, Jintao and Wei, Jia and Zhang, Pengle and Zhu, Jun and Chen, Jianfei},
