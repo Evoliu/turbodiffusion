@@ -15,8 +15,11 @@
 
 import argparse
 import math
+import os
+import time
 
 import torch
+import torch.distributed as dist
 from einops import rearrange, repeat
 from tqdm import tqdm
 
@@ -52,7 +55,38 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--quant_linear", action="store_true", help="Whether to replace Linear layers with quantized versions")
     parser.add_argument("--default_norm", action="store_true", help="Whether to replace LayerNorm/RMSNorm layers with faster versions")
     parser.add_argument("--serve", action="store_true", help="Launch interactive TUI server mode (keeps model loaded)")
+    parser.add_argument("--enable_parallelism", action="store_true", help="Enable multi-GPU context (sequence) parallelism to speed up a single inference. Launch with torchrun --nproc_per_node=N")
     return parser.parse_args()
+
+
+def setup_device(enable_parallelism: bool):
+    """Pin this process to its own GPU as early as possible (before any CUDA
+    work), so per-rank models land on distinct devices. Does NOT init the
+    process group yet. Returns (rank, world_size, local_rank)."""
+    if not enable_parallelism or "RANK" not in os.environ:
+        return 0, 1, 0
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    torch.cuda.set_device(local_rank)
+    return rank, world_size, local_rank
+
+
+def init_cp_group(world_size: int, local_rank: int):
+    """Initialize torch.distributed and build a single CP group spanning all
+    ranks (Ulysses all-to-all sequence parallel). Call this AFTER loading the
+    text encoder / VAE, since their loaders only fetch weights on rank 0 and
+    rely on sync_model_states, which no-ops while the group is uninitialized
+    (letting every rank load independently instead)."""
+    if world_size < 2:
+        return None
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            device_id=torch.device(f"cuda:{local_rank}"),
+        )
+    return dist.new_group(ranks=list(range(world_size)))
 
 
 if __name__ == "__main__":
@@ -71,6 +105,13 @@ if __name__ == "__main__":
         log.error("--prompt is required (unless using --serve mode)")
         exit(1)
 
+    # Pin each process to its own GPU FIRST (before any CUDA allocation), but
+    # defer process-group init until after the text encoder / VAE are loaded.
+    rank, world_size, local_rank = setup_device(args.enable_parallelism)
+    is_main_process = rank == 0
+    if world_size > 1:
+        log.info(f"Context parallelism: rank {rank}/{world_size} on cuda:{local_rank}")
+
     log.info(f"Computing embedding for prompt: {args.prompt}")
     with torch.no_grad():
         text_emb = get_umt5_embedding(checkpoint_path=args.text_encoder_path, prompts=args.prompt).to(**tensor_kwargs)
@@ -80,8 +121,17 @@ if __name__ == "__main__":
     net = create_model(dit_path=args.dit_path, args=args).cpu()
     torch.cuda.empty_cache()
     log.success("Successfully loaded DiT model.")
-    
+
     tokenizer = Wan2pt1VAEInterface(vae_pth=args.vae_path)
+
+    # Now that per-rank models are loaded independently (text encoder / VAE
+    # loaders only fetch weights on rank 0 + rely on sync_model_states, which
+    # no-ops while the group is uninitialized), bring up the CP group.
+    cp_group = init_cp_group(world_size, local_rank)
+    if cp_group is not None:
+        net.enable_context_parallel(cp_group)
+        log.info(f"Model context parallel enabled across {world_size} GPUs.")
+
 
     w, h = VIDEO_RES_SIZE_INFO[args.resolution][args.aspect_ratio]
 
@@ -126,7 +176,11 @@ if __name__ == "__main__":
     ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
     total_steps = t_steps.shape[0] - 1
     net.cuda()
-    for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps)):
+    if world_size > 1:
+        dist.barrier()
+    torch.cuda.synchronize()
+    _t0 = time.perf_counter()
+    for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps, disable=not is_main_process)):
         with torch.no_grad():
             v_pred = net(x_B_C_T_H_W=x.to(**tensor_kwargs), timesteps_B_T=(t_cur.float() * ones * 1000).to(**tensor_kwargs), **condition).to(
                 torch.float64
@@ -137,15 +191,25 @@ if __name__ == "__main__":
                 device=tensor_kwargs["device"],
                 generator=generator,
             )
+    torch.cuda.synchronize()
+    if is_main_process:
+        log.info(f"[benchmark] sampling loop: {time.perf_counter() - _t0:.2f}s "
+                 f"({total_steps} steps, world_size={world_size})")
     samples = x.float()
     net.cpu()
     torch.cuda.empty_cache()
 
-    with torch.no_grad():
-        video = tokenizer.decode(samples)
+    if is_main_process:
+        with torch.no_grad():
+            video = tokenizer.decode(samples)
 
-    to_show.append(video.float().cpu())
+        to_show.append(video.float().cpu())
 
-    to_show = (1.0 + torch.stack(to_show, dim=0).clamp(-1, 1)) / 2.0
+        to_show = (1.0 + torch.stack(to_show, dim=0).clamp(-1, 1)) / 2.0
 
-    save_image_or_video(rearrange(to_show, "n b c t h w -> c t (n h) (b w)"), args.save_path, fps=16)
+        save_image_or_video(rearrange(to_show, "n b c t h w -> c t (n h) (b w)"), args.save_path, fps=16)
+        log.success(f"Video saved to: {args.save_path}")
+
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()

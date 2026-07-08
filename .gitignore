@@ -10,7 +10,13 @@ dist/
 
 # checkpoints
 checkpoints/
+ckpts/
 
 # outputs
 output*/
 *.mp4
+
+# local agent config, editor backups, reference clones
+.claude/
+*~
+third_part/

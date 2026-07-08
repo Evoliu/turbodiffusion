@@ -127,7 +127,7 @@ def _rms_norm_fwd_fused(
     rstd = tl.reshape(rstd, (BLOCK_M, 1))
 
     # Normalize and apply linear transformation
-    w = tl.load(W + cols)
+    w = tl.load(W + cols, mask=mask, other=0.0)
     x_hat = x * rstd
     y = x_hat * w
 
@@ -232,9 +232,9 @@ def _layer_norm_param_fwd_fused(
     # Normalize and apply linear transformation
     x_hat = (x - mean) * rstd
 
-    w = tl.load(W + cols)
-    b = tl.load(B + cols)
-    
+    w = tl.load(W + cols, mask=mask, other=0.0)
+    b = tl.load(B + cols, mask=mask, other=0.0)
+
     x_hat = x_hat * w + b
 
     # Write output
