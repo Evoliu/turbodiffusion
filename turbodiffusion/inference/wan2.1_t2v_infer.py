@@ -55,6 +55,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--quant_linear", action="store_true", help="Whether to replace Linear layers with quantized versions")
     parser.add_argument("--default_norm", action="store_true", help="Whether to replace LayerNorm/RMSNorm layers with faster versions")
     parser.add_argument("--enable_sac", action="store_true", help="[Debug] Re-enable Selective Activation Checkpoint. Inference disables it by default because SAC wraps every block in checkpoint_wrapper, adding host-side overhead with no memory benefit when torch.no_grad() is active.")
+    parser.add_argument("--sampler_dtype", choices=["fp32", "fp64"], default="fp64",
+                        help="[Debug] Precision of the outer sampling loop state (x, t_steps, elementwise ops "
+                             "around net(...)). The DiT itself always runs in bf16. Default fp64 matches the "
+                             "original training/inference recipe; 4-step distilled sampling appears to be very "
+                             "sensitive to this (fp32 diverges — cosine sim ~0.67 to fp64 output). Use --sampler_dtype fp32 "
+                             "only to A/B the fp64 kernel cost on consumer GPUs (RTX 5090 fp64 = fp32/64).")
     parser.add_argument("--serve", action="store_true", help="Launch interactive TUI server mode (keeps model loaded)")
     parser.add_argument("--enable_parallelism", action="store_true", help="Enable multi-GPU context (sequence) parallelism to speed up a single inference. Launch with torchrun --nproc_per_node=N")
     parser.add_argument("--profile", action="store_true", help="Profiling mode: run the sampling loop repeatedly and print timing stats (mean/median/min/max/FPS). Skips VAE decode + save.")
@@ -167,9 +173,13 @@ if __name__ == "__main__":
     # For better visual quality
     mid_t = [1.5, 1.4, 1.0][: args.num_steps - 1]
 
+    # Sampler-loop precision. DiT internals still run in bf16 (tensor_kwargs);
+    # this only controls x / t_steps / elementwise ops around the net call.
+    sampler_dtype = torch.float64 if args.sampler_dtype == "fp64" else torch.float32
+
     t_steps = torch.tensor(
         [math.atan(args.sigma_max), *mid_t, 0],
-        dtype=torch.float64,
+        dtype=sampler_dtype,
         device=init_noise.device,
     )
 
@@ -177,7 +187,7 @@ if __name__ == "__main__":
     t_steps = torch.sin(t_steps) / (torch.cos(t_steps) + torch.sin(t_steps))
 
     # Sampling steps
-    ones = torch.ones(init_noise.size(0), 1, device=init_noise.device, dtype=torch.float64)
+    ones = torch.ones(init_noise.size(0), 1, device=init_noise.device, dtype=sampler_dtype)
     total_steps = t_steps.shape[0] - 1
     net.cuda()
 
@@ -191,16 +201,16 @@ if __name__ == "__main__":
             args.num_samples, *state_shape,
             dtype=torch.float32, device=tensor_kwargs["device"], generator=gen,
         )
-        x = noise.to(torch.float64) * t_steps[0]
+        x = noise.to(sampler_dtype) * t_steps[0]
         for t_cur, t_next in zip(t_steps[:-1], t_steps[1:]):
             with torch.no_grad():
                 v_pred = net(
                     x_B_C_T_H_W=x.to(**tensor_kwargs),
                     timesteps_B_T=(t_cur.float() * ones * 1000).to(**tensor_kwargs),
                     **condition,
-                ).to(torch.float64)
+                ).to(sampler_dtype)
                 x = (1 - t_next) * (x - t_cur * v_pred) + t_next * torch.randn(
-                    *x.shape, dtype=torch.float32,
+                    *x.shape, dtype=sampler_dtype,
                     device=tensor_kwargs["device"], generator=gen,
                 )
         return x
@@ -272,15 +282,15 @@ if __name__ == "__main__":
         dist.barrier()
     torch.cuda.synchronize()
     _t0 = time.perf_counter()
-    x = init_noise.to(torch.float64) * t_steps[0]
+    x = init_noise.to(sampler_dtype) * t_steps[0]
     for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps, disable=not is_main_process)):
         with torch.no_grad():
             v_pred = net(x_B_C_T_H_W=x.to(**tensor_kwargs), timesteps_B_T=(t_cur.float() * ones * 1000).to(**tensor_kwargs), **condition).to(
-                torch.float64
+                sampler_dtype
             )
             x = (1 - t_next) * (x - t_cur * v_pred) + t_next * torch.randn(
                 *x.shape,
-                dtype=torch.float32,
+                dtype=sampler_dtype,
                 device=tensor_kwargs["device"],
                 generator=generator,
             )
