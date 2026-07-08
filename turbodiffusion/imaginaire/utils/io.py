@@ -114,10 +114,12 @@ def save_image_or_video(
         kwargs["ffmpeg_params"] = ffmpeg_params
 
     if tensor.shape[1] == 1:
-        # Note: rearrange before .numpy() — einops on some envs fails to
-        # dispatch numpy arrays; keeping the tensor as torch avoids that.
+        # Cast to uint8 in torch first, then rearrange, then .numpy().
+        # Doing (torch->float32-numpy).astype(uint8) triggered an imageio
+        # "object-dtype" complaint on some environments (numpy 1.26 + torch 2.8).
+        u8 = (tensor.cpu().float() * 255 + 0.5).clamp(0, 255).to(torch.uint8)
         save_obj = PILImage.fromarray(
-            (rearrange(tensor.cpu().float() * 255, "c 1 h w -> h w c").numpy() + 0.5).astype(np.uint8),
+            rearrange(u8, "c 1 h w -> h w c").contiguous().numpy(),
             mode="RGB",
         )
         if isinstance(save_path, str):
@@ -127,7 +129,8 @@ def save_image_or_video(
                 save_path = f"{base}.jpg"
         easy_io.dump(save_obj, save_path, file_format="jpg", format="JPEG", quality=85, **kwargs)
     else:
-        save_obj = (rearrange(tensor.cpu().float() * 255, "c t h w -> t h w c").numpy() + 0.5).astype(np.uint8)
+        u8 = (tensor.cpu().float() * 255 + 0.5).clamp(0, 255).to(torch.uint8)
+        save_obj = rearrange(u8, "c t h w -> t h w c").contiguous().numpy()
         if isinstance(save_path, str):
             # Check if path already has an extension
             base, ext = os.path.splitext(save_path)
