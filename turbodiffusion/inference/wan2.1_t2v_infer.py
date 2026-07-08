@@ -56,6 +56,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--default_norm", action="store_true", help="Whether to replace LayerNorm/RMSNorm layers with faster versions")
     parser.add_argument("--serve", action="store_true", help="Launch interactive TUI server mode (keeps model loaded)")
     parser.add_argument("--enable_parallelism", action="store_true", help="Enable multi-GPU context (sequence) parallelism to speed up a single inference. Launch with torchrun --nproc_per_node=N")
+    parser.add_argument("--profile", action="store_true", help="Profiling mode: run the sampling loop repeatedly and print timing stats (mean/median/min/max/FPS). Skips VAE decode + save.")
+    parser.add_argument("--warmup", type=int, default=3, help="Untimed warmup iterations under --profile (default 3).")
+    parser.add_argument("--repeats", type=int, default=10, help="Timed iterations under --profile (default 10).")
+    parser.add_argument("--profile_csv", type=str, default=None, help="If set with --profile, append the summary row to this CSV path.")
     return parser.parse_args()
 
 
@@ -172,14 +176,102 @@ if __name__ == "__main__":
     t_steps = torch.sin(t_steps) / (torch.cos(t_steps) + torch.sin(t_steps))
 
     # Sampling steps
-    x = init_noise.to(torch.float64) * t_steps[0]
-    ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
+    ones = torch.ones(init_noise.size(0), 1, device=init_noise.device, dtype=torch.float64)
     total_steps = t_steps.shape[0] - 1
     net.cuda()
+
+    def _run_sampling(seed_offset: int = 0) -> torch.Tensor:
+        """Run one full sampling loop. Returns the final latent x.
+        seed_offset lets profile repeats use distinct RNG streams while keeping
+        the shape / kernel path identical across iterations."""
+        gen = torch.Generator(device=tensor_kwargs["device"])
+        gen.manual_seed(args.seed + seed_offset)
+        noise = torch.randn(
+            args.num_samples, *state_shape,
+            dtype=torch.float32, device=tensor_kwargs["device"], generator=gen,
+        )
+        x = noise.to(torch.float64) * t_steps[0]
+        for t_cur, t_next in zip(t_steps[:-1], t_steps[1:]):
+            with torch.no_grad():
+                v_pred = net(
+                    x_B_C_T_H_W=x.to(**tensor_kwargs),
+                    timesteps_B_T=(t_cur.float() * ones * 1000).to(**tensor_kwargs),
+                    **condition,
+                ).to(torch.float64)
+                x = (1 - t_next) * (x - t_cur * v_pred) + t_next * torch.randn(
+                    *x.shape, dtype=torch.float32,
+                    device=tensor_kwargs["device"], generator=gen,
+                )
+        return x
+
+    if args.profile:
+        # Profiling mode: warmup + repeats, print stats. Skip VAE decode / save.
+        import statistics
+        if world_size > 1:
+            dist.barrier()
+        torch.cuda.synchronize()
+
+        for w in range(args.warmup):
+            _ = _run_sampling(seed_offset=w)
+            torch.cuda.synchronize()
+            if is_main_process:
+                log.info(f"[profile] warmup {w+1}/{args.warmup} done")
+
+        times = []
+        for r in range(args.repeats):
+            if world_size > 1:
+                dist.barrier()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            _ = _run_sampling(seed_offset=args.warmup + r)
+            torch.cuda.synchronize()
+            dt = time.perf_counter() - t0
+            times.append(dt)
+            if is_main_process:
+                log.info(f"[profile] repeat {r+1}/{args.repeats}: {dt:.3f}s")
+
+        if is_main_process:
+            mean = statistics.mean(times)
+            median = statistics.median(times)
+            stdev = statistics.stdev(times) if len(times) > 1 else 0.0
+            tmin, tmax = min(times), max(times)
+            fps = args.num_frames / median
+            log.success(
+                f"[profile] world_size={world_size} steps={total_steps} "
+                f"num_frames={args.num_frames} | "
+                f"mean={mean:.3f}s median={median:.3f}s "
+                f"min={tmin:.3f}s max={tmax:.3f}s stdev={stdev:.3f}s | "
+                f"FPS(median)={fps:.2f}"
+            )
+            if args.profile_csv:
+                import csv, pathlib
+                pathlib.Path(args.profile_csv).parent.mkdir(parents=True, exist_ok=True)
+                new = not pathlib.Path(args.profile_csv).exists()
+                with open(args.profile_csv, "a", newline="") as f:
+                    wr = csv.writer(f)
+                    if new:
+                        wr.writerow(["world_size", "model", "resolution", "num_frames",
+                                     "num_steps", "warmup", "repeats",
+                                     "mean_s", "median_s", "min_s", "max_s", "stdev_s",
+                                     "fps_median"])
+                    wr.writerow([world_size, args.model, args.resolution, args.num_frames,
+                                 total_steps, args.warmup, args.repeats,
+                                 f"{mean:.4f}", f"{median:.4f}", f"{tmin:.4f}",
+                                 f"{tmax:.4f}", f"{stdev:.4f}", f"{fps:.4f}"])
+                log.info(f"[profile] appended to {args.profile_csv}")
+
+        net.cpu()
+        torch.cuda.empty_cache()
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+        exit(0)
+
     if world_size > 1:
         dist.barrier()
     torch.cuda.synchronize()
     _t0 = time.perf_counter()
+    x = init_noise.to(torch.float64) * t_steps[0]
     for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps, disable=not is_main_process)):
         with torch.no_grad():
             v_pred = net(x_B_C_T_H_W=x.to(**tensor_kwargs), timesteps_B_T=(t_cur.float() * ones * 1000).to(**tensor_kwargs), **condition).to(
