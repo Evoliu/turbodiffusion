@@ -59,6 +59,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--sla_topk", type=float, default=0.1, help="Top-k ratio for SLA/SageSLA attention")
     parser.add_argument("--quant_linear", action="store_true", help="Whether to replace Linear layers with quantized versions")
     parser.add_argument("--default_norm", action="store_true", help="Whether to replace LayerNorm/RMSNorm layers with faster versions")
+    parser.add_argument("--enable_sac", action="store_true", help="[Debug] Re-enable Selective Activation Checkpoint. Inference disables it by default because SAC wraps every block in checkpoint_wrapper, adding host-side overhead with no memory benefit when torch.no_grad() is active.")
     parser.add_argument("--serve", action="store_true", help="Launch interactive TUI server mode (keeps model loaded)")
     return parser.parse_args()
 

@@ -35,6 +35,7 @@ from SLA import (
     SparseLinearAttention as SLA,
     SageSparseLinearAttention as SageSLA
 )
+from rcm.utils.selective_activation_checkpoint import CheckpointMode, SACConfig
 
 
 def replace_attention(
@@ -83,7 +84,15 @@ def replace_linear_norm(
 
 tensor_kwargs = {"device": "cuda", "dtype": torch.bfloat16}
 
-def select_model(model_name: str) -> torch.nn.Module:
+
+# Inference doesn't need Selective Activation Checkpoint (it's a training-time
+# memory-saving trick that wraps every DiT block in checkpoint_wrapper, adding
+# per-block Python + saved_tensors_hooks overhead even under torch.no_grad()).
+# Force it off by default; expose a flag for A/B comparisons.
+_INFERENCE_SAC = SACConfig(mode=CheckpointMode.NONE)
+
+
+def select_model(model_name: str, sac_config: SACConfig = _INFERENCE_SAC) -> torch.nn.Module:
     if model_name == "Wan2.1-1.3B":
         return WanModel2pt1(
             dim=1536,
@@ -96,6 +105,7 @@ def select_model(model_name: str) -> torch.nn.Module:
             num_layers=30,
             out_dim=16,
             text_len=512,
+            sac_config=sac_config,
         )
     elif model_name == "Wan2.1-14B":
         return WanModel2pt1(
@@ -109,6 +119,7 @@ def select_model(model_name: str) -> torch.nn.Module:
             num_layers=40,
             out_dim=16,
             text_len=512,
+            sac_config=sac_config,
         )
     elif model_name == "Wan2.2-A14B":
         return WanModel2pt2(
@@ -122,14 +133,17 @@ def select_model(model_name: str) -> torch.nn.Module:
             num_layers=40,
             out_dim=16,
             text_len=512,
+            sac_config=sac_config,
         )
     else:
         raise ValueError(f"Unknown model name: {model_name}")
 
 
 def create_model(dit_path: str, args: argparse.Namespace) -> torch.nn.Module:
+    # Allow --enable_sac to opt back in (for A/B comparison); default off.
+    sac_config = SACConfig() if getattr(args, "enable_sac", False) else _INFERENCE_SAC
     with torch.device("meta"):
-        net = select_model(args.model)
+        net = select_model(args.model, sac_config=sac_config)
 
     state_dict = load_state_dict(dit_path)
     if args.attention_type in ['sla', 'sagesla']:
