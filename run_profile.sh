@@ -1,15 +1,27 @@
 #!/usr/bin/env bash
 # TurboDiffusion multi-GPU CP profiling on 5090 (6 cards).
-# Sweeps NPROC in 1 2 3 4 6 (skips 5: Wan2.1-1.3B num_heads=12 not divisible by 5).
+# Sweeps NPROC over divisors of the model's num_heads (auto-derived) unless
+# NPROC_LIST is set explicitly.
+#   Wan2.1-1.3B (num_heads=12) → 1 2 3 4 6 on 6 GPUs
+#   Wan2.1-14B  (num_heads=40) → 1 2 4 5   on 6 GPUs (3 & 6 skipped)
 # Each NPROC: warmup=3 (default) + repeats=10 (default), reports median FPS.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
 # ===== Tunables =====
-NPROC_LIST=${NPROC_LIST:-"1 2 3 4 6"}   # 6-card 5090; 5 skipped (12 % 5 != 0)
 MODEL=${MODEL:-Wan2.1-1.3B}
-DIT_PATH=${DIT_PATH:-checkpoints/TurboWan2.1-T2V-1.3B-480P-quant.pth}
+MAX_GPUS=${MAX_GPUS:-6}                 # this box has 6x 5090
+# Auto-pick DIT_PATH from MODEL if not given
+if [ "$MODEL" = "Wan2.1-14B" ]; then
+    DIT_PATH=${DIT_PATH:-checkpoints/TurboWan2.1-T2V-14B-480P-quant.pth}
+    NUM_HEADS=40
+elif [ "$MODEL" = "Wan2.1-1.3B" ]; then
+    DIT_PATH=${DIT_PATH:-checkpoints/TurboWan2.1-T2V-1.3B-480P-quant.pth}
+    NUM_HEADS=12
+else
+    echo "Unsupported MODEL=$MODEL (expected Wan2.1-1.3B or Wan2.1-14B)"; exit 1
+fi
 RESOLUTION=${RESOLUTION:-480p}
 NUM_FRAMES=${NUM_FRAMES:-81}
 NUM_STEPS=${NUM_STEPS:-4}
@@ -17,8 +29,18 @@ SLA_TOPK=${SLA_TOPK:-0.1}
 WARMUP=${WARMUP:-3}
 REPEATS=${REPEATS:-10}
 PROMPT=${PROMPT:-"A stylish woman walks down a Tokyo street filled with warm glowing neon."}
-CSV=${CSV:-output/profile.csv}
+CSV=${CSV:-output/profile_${MODEL//./pt}.csv}
 MASTER_PORT=${MASTER_PORT:-29511}
+
+# NPROC_LIST auto: divisors of NUM_HEADS in [1..MAX_GPUS]. Override by setting NPROC_LIST=...
+if [ -z "${NPROC_LIST:-}" ]; then
+    NPROC_LIST=""
+    for n in $(seq 1 "$MAX_GPUS"); do
+        if [ $((NUM_HEADS % n)) -eq 0 ]; then
+            NPROC_LIST+="$n "
+        fi
+    done
+fi
 
 # ===== Env =====
 export PYTHONPATH=turbodiffusion
@@ -26,14 +48,6 @@ export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 export TOKENIZERS_PARALLELISM=false
 
 mkdir -p "$(dirname "$CSV")"
-: > "${CSV}.new"   # start fresh; move on success at end
-
-# num_heads for the head-divisibility check
-if [ "$MODEL" = "Wan2.1-14B" ]; then
-    NUM_HEADS=40
-else
-    NUM_HEADS=12
-fi
 
 COMMON_ARGS=(
     --model "$MODEL"
@@ -53,10 +67,22 @@ COMMON_ARGS=(
 )
 
 echo "=== Profile config ==="
-echo "  MODEL=$MODEL  RES=$RESOLUTION  FRAMES=$NUM_FRAMES  STEPS=$NUM_STEPS"
-echo "  WARMUP=$WARMUP  REPEATS=$REPEATS  NPROC_LIST=[$NPROC_LIST]  NUM_HEADS=$NUM_HEADS"
+echo "  MODEL=$MODEL  DIT_PATH=$DIT_PATH"
+echo "  RES=$RESOLUTION  FRAMES=$NUM_FRAMES  STEPS=$NUM_STEPS  NUM_HEADS=$NUM_HEADS"
+echo "  WARMUP=$WARMUP  REPEATS=$REPEATS  NPROC_LIST=[$NPROC_LIST]"
 echo "  CSV=$CSV"
 echo
+
+# Sanity: DIT weight must exist
+if [ ! -f "$DIT_PATH" ]; then
+    echo "ERROR: DIT weights not found at $DIT_PATH"
+    if [ "$MODEL" = "Wan2.1-14B" ]; then
+        echo "Download it with:"
+        echo "  mkdir -p checkpoints && cd checkpoints && \\"
+        echo "  wget -c https://hf-mirror.com/TurboDiffusion/TurboWan2.1-T2V-14B-480P/resolve/main/TurboWan2.1-T2V-14B-480P-quant.pth"
+    fi
+    exit 1
+fi
 
 # Wipe old CSV so the summary at the end reflects THIS run only
 rm -f "$CSV"
