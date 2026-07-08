@@ -114,8 +114,10 @@ def save_image_or_video(
         kwargs["ffmpeg_params"] = ffmpeg_params
 
     if tensor.shape[1] == 1:
+        # Note: rearrange before .numpy() — einops on some envs fails to
+        # dispatch numpy arrays; keeping the tensor as torch avoids that.
         save_obj = PILImage.fromarray(
-            (rearrange((tensor.cpu().float().numpy() * 255), "c 1 h w -> h w c") + 0.5).astype(np.uint8),
+            (rearrange(tensor.cpu().float() * 255, "c 1 h w -> h w c").numpy() + 0.5).astype(np.uint8),
             mode="RGB",
         )
         if isinstance(save_path, str):
@@ -125,7 +127,7 @@ def save_image_or_video(
                 save_path = f"{base}.jpg"
         easy_io.dump(save_obj, save_path, file_format="jpg", format="JPEG", quality=85, **kwargs)
     else:
-        save_obj = (rearrange((tensor.cpu().float().numpy() * 255), "c t h w -> t h w c") + 0.5).astype(np.uint8)
+        save_obj = (rearrange(tensor.cpu().float() * 255, "c t h w -> t h w c").numpy() + 0.5).astype(np.uint8)
         if isinstance(save_path, str):
             # Check if path already has an extension
             base, ext = os.path.splitext(save_path)
