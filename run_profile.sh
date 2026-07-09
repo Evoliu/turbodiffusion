@@ -29,7 +29,16 @@ SLA_TOPK=${SLA_TOPK:-0.1}
 WARMUP=${WARMUP:-3}
 REPEATS=${REPEATS:-10}
 PROMPT=${PROMPT:-"A stylish woman walks down a Tokyo street filled with warm glowing neon."}
-CSV=${CSV:-output/profile_${MODEL//./pt}.csv}
+# torch.compile knobs. Set COMPILE=0 to disable.
+# max-autotune-no-cudagraphs was the best mode on 5090 in our testing
+# (default: 2.38s, reduce-overhead: 2.51s, max-autotune-no-cudagraphs: 2.32s).
+COMPILE=${COMPILE:-1}
+COMPILE_MODE=${COMPILE_MODE:-max-autotune-no-cudagraphs}
+# Suffix the CSV with the compile mode so re-runs don't overwrite prior
+# baselines. Escape dots and slashes for filesystem safety.
+_compile_tag="compile_${COMPILE_MODE//\//-}"
+[ "$COMPILE" = "0" ] && _compile_tag="nocompile"
+CSV=${CSV:-output/profile_${MODEL//./pt}_${_compile_tag}.csv}
 MASTER_PORT=${MASTER_PORT:-29511}
 
 # NPROC_LIST auto: divisors of NUM_HEADS in [1..MAX_GPUS]. Override by setting NPROC_LIST=...
@@ -65,11 +74,15 @@ COMMON_ARGS=(
     --repeats "$REPEATS"
     --profile_csv "$CSV"
 )
+if [ "$COMPILE" != "0" ]; then
+    COMMON_ARGS+=(--compile --compile_mode "$COMPILE_MODE")
+fi
 
 echo "=== Profile config ==="
 echo "  MODEL=$MODEL  DIT_PATH=$DIT_PATH"
 echo "  RES=$RESOLUTION  FRAMES=$NUM_FRAMES  STEPS=$NUM_STEPS  NUM_HEADS=$NUM_HEADS"
 echo "  WARMUP=$WARMUP  REPEATS=$REPEATS  NPROC_LIST=[$NPROC_LIST]"
+echo "  COMPILE=$COMPILE  MODE=$COMPILE_MODE"
 echo "  CSV=$CSV"
 echo
 
