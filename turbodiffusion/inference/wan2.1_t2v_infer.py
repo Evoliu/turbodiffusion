@@ -245,6 +245,14 @@ if __name__ == "__main__":
         x = noise.to(sampler_dtype) * t_steps[0]
         for t_cur, t_next in zip(t_steps[:-1], t_steps[1:]):
             with torch.no_grad():
+                # Under torch.compile(mode='reduce-overhead') the DiT forward
+                # is captured as a CUDA Graph. Tensors allocated inside that
+                # graph (e.g. self.dim_spatial_range in cache_parameters()) get
+                # overwritten by the next replay unless we announce a new step
+                # boundary first. No-op when compile is disabled or when the
+                # mode doesn't use CUDA Graphs.
+                if args.compile:
+                    torch.compiler.cudagraph_mark_step_begin()
                 v_pred = net(
                     x_B_C_T_H_W=x.to(**tensor_kwargs),
                     timesteps_B_T=(t_cur.float() * ones * 1000).to(**tensor_kwargs),
@@ -326,6 +334,9 @@ if __name__ == "__main__":
     x = init_noise.to(sampler_dtype) * t_steps[0]
     for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps, disable=not is_main_process)):
         with torch.no_grad():
+            # Same CUDA Graph step-boundary announcement as _run_sampling().
+            if args.compile:
+                torch.compiler.cudagraph_mark_step_begin()
             v_pred = net(x_B_C_T_H_W=x.to(**tensor_kwargs), timesteps_B_T=(t_cur.float() * ones * 1000).to(**tensor_kwargs), **condition).to(
                 sampler_dtype
             )
