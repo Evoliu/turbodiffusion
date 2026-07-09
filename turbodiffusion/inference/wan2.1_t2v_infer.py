@@ -171,6 +171,28 @@ if __name__ == "__main__":
         # Full). Graph breaks on SageSLA / Int8Linear are expected — dynamo
         # falls back to eager for those and re-enters compile after, without
         # error unless fullgraph=True.
+        # ------------------------------------------------------------------
+        # Pre-populate lazy caches BEFORE torch.compile is applied.
+        # ------------------------------------------------------------------
+        # rcm/networks/wan2pt1.py:VideoRopePosition3DEmb.cache_parameters()
+        # allocates self.seq / dim_spatial_range / dim_temporal_range on
+        # first call, then flips _is_initialized=True. If CUDA Graphs
+        # capture that first call, the tensors live in the graph's memory
+        # pool and get overwritten by the next replay. cudagraph_mark_step_
+        # begin() doesn't help here because those tensors persist across
+        # steps as read-only cache. Fix: call cache_parameters() ONCE now,
+        # outside any graph capture, so the compiled forward only sees the
+        # `if _is_initialized: return` fast-path — the tensors it reads are
+        # allocated in the normal caching allocator, not the graph pool.
+        _prepop = 0
+        for _m in net.modules():
+            if hasattr(_m, "cache_parameters") and hasattr(_m, "_is_initialized"):
+                if not _m._is_initialized:
+                    _m.cache_parameters()
+                    _prepop += 1
+        if _prepop:
+            log.info(f"pre-populated lazy caches on {_prepop} module(s) before compile")
+
         log.info(f"Compiling DiT with torch.compile(mode='{args.compile_mode}', "
                  f"dynamic={args.compile_dynamic}, fullgraph={args.compile_fullgraph})...")
         # Suppress dynamo errors so a bad compile falls back to eager rather
