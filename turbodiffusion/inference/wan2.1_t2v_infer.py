@@ -67,6 +67,26 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=3, help="Untimed warmup iterations under --profile (default 3).")
     parser.add_argument("--repeats", type=int, default=10, help="Timed iterations under --profile (default 10).")
     parser.add_argument("--profile_csv", type=str, default=None, help="If set with --profile, append the summary row to this CSV path.")
+    parser.add_argument("--compile", action="store_true",
+                        help="[Experimental] Wrap the DiT with torch.compile(). Fuses elementwise "
+                             "ops (adaLN scale/shift/gate, add/mul chains) that show up in the "
+                             "profiler as ~1s of aten::copy_/add/mul; leaves custom kernels "
+                             "(SageSLA, Int8Linear, FastRMSNorm) unchanged. Extra ~30-90s at first "
+                             "warmup for graph compilation; measured repeats amortize it. Set "
+                             "--compile_mode to pick backend/mode.")
+    parser.add_argument("--compile_mode", default="reduce-overhead",
+                        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+                        help="torch.compile mode. reduce-overhead uses CUDA Graphs internally when "
+                             "safe, which is what host-bound sampling wants. max-autotune spends "
+                             "much longer at first warmup to find optimal tiles.")
+    parser.add_argument("--compile_dynamic", action="store_true",
+                        help="Pass dynamic=True to torch.compile. Slower for a fixed shape (which "
+                             "is our case since latent shape is constant), but faster to compile "
+                             "and doesn't recompile if input shape changes. Default False.")
+    parser.add_argument("--compile_fullgraph", action="store_true",
+                        help="Pass fullgraph=True — makes torch.compile HARD-FAIL on any graph "
+                             "break instead of silently falling back. Use this to diagnose "
+                             "which custom kernel is breaking dynamo. Default False (allow breaks).")
     return parser.parse_args()
 
 
@@ -142,6 +162,27 @@ if __name__ == "__main__":
     if cp_group is not None:
         net.enable_context_parallel(cp_group)
         log.info(f"Model context parallel enabled across {world_size} GPUs.")
+
+    # Optional torch.compile wrap. Placed AFTER CP setup so compile sees the
+    # already-hooked module (a2a hooks live inside enable_context_parallel).
+    if args.compile:
+        # torch.compile with reduce-overhead mode uses CUDA Graphs, which is
+        # the whole point on host-bound 5090 (see profiler: 30% Command Buffer
+        # Full). Graph breaks on SageSLA / Int8Linear are expected — dynamo
+        # falls back to eager for those and re-enters compile after, without
+        # error unless fullgraph=True.
+        log.info(f"Compiling DiT with torch.compile(mode='{args.compile_mode}', "
+                 f"dynamic={args.compile_dynamic}, fullgraph={args.compile_fullgraph})...")
+        # Suppress dynamo errors so a bad compile falls back to eager rather
+        # than crashing — but we log via TORCH_LOGS=recompiles for diagnosis.
+        torch._dynamo.config.suppress_errors = not args.compile_fullgraph
+        _compile_kwargs = dict(mode=args.compile_mode)
+        if args.compile_dynamic:
+            _compile_kwargs["dynamic"] = True
+        if args.compile_fullgraph:
+            _compile_kwargs["fullgraph"] = True
+        net = torch.compile(net, **_compile_kwargs)
+        log.info("torch.compile applied. First warmup will be slower (graph compilation).")
 
 
     w, h = VIDEO_RES_SIZE_INFO[args.resolution][args.aspect_ratio]
